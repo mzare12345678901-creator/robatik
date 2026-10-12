@@ -1,566 +1,383 @@
 
 import os
+import re
 import json
 import time
 import base64
-import sqlite3
 import tempfile
 import subprocess
 from pathlib import Path
 
 import requests
 import imageio_ffmpeg
-from fastapi import FastAPI, Request, HTTPException
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
 
-BALE_TOKEN = os.getenv("BALE_BOT_TOKEN", "986540587:U_VZeXT1CLfQoF8SOBh0vNzOGQG6ywaA7Z8")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@viiideoai")
-DESTINATION_CHANNEL = os.getenv("DESTINATION_CHANNEL", "")
-
-AI_API_KEY = os.getenv("AIMLAPI_KEY", "bf751be0f71269ae1b94e02785a15708")
+BALE_TOKEN = os.getenv("BALE_BOT_TOKEN", "986540587U_VZeXT1CLfQoF8SOBh0vNzOGQG6ywaA7Z8").strip()
+AI_KEY = os.getenv("AIMLAPI_KEY", "bf751be0f71269ae1b94e02785a15708").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@viiideoai").strip().lstrip("@").lower()
+DEST_CHANNEL = os.getenv("DEST_CHANNEL", "").strip()
 AI_BASE_URL = os.getenv(
     "AIMLAPI_BASE_URL", "https://api.aimlapi.com/v1"
 ).rstrip("/")
-AI_MODEL = os.getenv(
-    "AIMLAPI_MODEL", "google/gemini-2.5-flash"
-)
+AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash")
 
-MAX_VIDEO_MB = 35
-MAX_VIDEO_SECONDS = 180
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+BALE_API = "https://tapi.bale.ai/bot" + BALE_TOKEN
 
-app = FastAPI(title="Bale AI Video Rewriter")
-
-BALE_API = (
-    "https://tapi.bale.ai/bot" + BALE_TOKEN
-    if BALE_TOKEN else ""
-)
-
+# اطلاعات ویدئوهای در انتظار تأیید؛ تا زمان اجرای این پردازش در حافظه است.
+pending = {}
+offset = 0
 session = requests.Session()
 
 
-# =========================================================
-# DATABASE
-# =========================================================
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS pending (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_path TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                source_message_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at INTEGER NOT NULL
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS processed (
-                message_key TEXT PRIMARY KEY
-            )
-        """)
-
-
-init_db()
-
-
-# =========================================================
-# BALE BOT API
-# =========================================================
-
-def bale_call(method, data=None, timeout=60):
-    if not BALE_API:
-        raise RuntimeError("BALE_BOT_TOKEN تنظیم نشده است.")
-
+def bale(method, data=None, files=None, timeout=60):
+    """ارسال درخواست به API بله."""
     response = session.post(
         f"{BALE_API}/{method}",
-        json=data or {},
+        data=data or {},
+        files=files,
         timeout=timeout,
     )
     response.raise_for_status()
-
     result = response.json()
-    if not result.get("ok", False):
+
+    if not result.get("ok"):
         raise RuntimeError(
-            f"Bale API error: {result}"
+            f"Bale API {method}: {result.get('description', 'Unknown error')}"
         )
 
     return result.get("result")
 
 
-def send_message(chat_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-    }
-
-    if keyboard:
-        payload["reply_markup"] = {
-            "inline_keyboard": keyboard
-        }
-
-    return bale_call("sendMessage", payload)
-
-
-def answer_callback(callback_id, text):
-    try:
-        bale_call("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": text,
-        })
-    except Exception:
-        pass
-
-
-def send_video(chat_id, video_path, caption):
-    # Upload the local video file to the destination channel.
-    with open(video_path, "rb") as file:
-        response = session.post(
-            f"{BALE_API}/sendVideo",
-            data={
-                "chat_id": chat_id,
-                "caption": caption[:1000],
-            },
-            files={
-                "video": (
-                    Path(video_path).name,
-                    file,
-                    "video/mp4",
-                )
-            },
-            timeout=180,
-        )
-
-    response.raise_for_status()
-    result = response.json()
-
-    if not result.get("ok", False):
-        raise RuntimeError(
-            f"Bale sendVideo error: {result}"
-        )
-
-    return result.get("result")
-
-
-# =========================================================
-# VIDEO DOWNLOAD
-# =========================================================
-
-def download_bale_video(file_id):
-    # This assumes Bale's Bot API supports getFile and the
-    # Telegram-compatible file download URL.
-    result = bale_call(
-        "getFile",
-        {"file_id": file_id},
+def send_text(chat_id, text):
+    return bale(
+        "sendMessage",
+        {"chat_id": str(chat_id), "text": str(text)[:4000]},
     )
 
-    file_path = result.get("file_path")
+
+def get_chat_id(update):
+    message = update.get("message") or update.get("channel_post") or {}
+    return (message.get("chat") or {}).get("id")
+
+
+def source_matches(message):
+    chat = message.get("chat") or {}
+    username = str(chat.get("username", "")).lower()
+    return username == SOURCE_CHANNEL
+
+
+def download_video(file_id, destination):
+    info = bale("getFile", {"file_id": file_id})
+    file_path = info.get("file_path")
+
     if not file_path:
-        raise RuntimeError(
-            "API مسیر فایل ویدئو را برنگرداند."
-        )
+        raise RuntimeError("Bale did not return file_path")
 
-    url = (
-        "https://tapi.bale.ai/file/bot"
-        + BALE_TOKEN + "/" + file_path
-    )
+    url = f"https://tapi.bale.ai/file/bot{BALE_TOKEN}/{file_path}"
 
-    temp = tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False
-    )
-    temp.close()
-
-    total = 0
-    try:
-        with session.get(
-            url, stream=True, timeout=120
-        ) as response:
-            response.raise_for_status()
-
-            with open(temp.name, "wb") as output:
-                for chunk in response.iter_content(1024 * 256):
-                    if not chunk:
-                        continue
-
-                    total += len(chunk)
-                    if total > MAX_VIDEO_MB * 1024 * 1024:
-                        raise ValueError(
-                            "حجم ویدئو بیشتر از حد مجاز است."
-                        )
-
+    with session.get(url, stream=True, timeout=180) as response:
+        response.raise_for_status()
+        with open(destination, "wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if chunk:
                     output.write(chunk)
 
-        return temp.name
 
-    except Exception:
-        Path(temp.name).unlink(missing_ok=True)
-        raise
-
-
-# =========================================================
-# VIDEO ANALYSIS
-# =========================================================
-
-def extract_frames(video_path):
-    """Extract up to four frames for visual analysis."""
+def extract_frames(video_path, folder):
+    """استخراج حداکثر چهار تصویر از ویدئو."""
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    frames = []
+    pattern = str(Path(folder) / "frame_%02d.jpg")
 
-    with tempfile.TemporaryDirectory() as directory:
-        output_pattern = str(
-            Path(directory) / "frame-%02d.jpg"
-        )
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", video_path,
+        "-vf", "fps=1/5,scale=640:-1",
+        "-frames:v", "4",
+        "-y", pattern,
+    ]
 
-        command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel", "error",
-            "-i", video_path,
-            "-t", str(MAX_VIDEO_SECONDS),
-            "-vf",
-            "fps=1/8,scale=640:-2",
-            "-frames:v", "4",
-            "-q:v", "5",
-            output_pattern,
-            "-y",
-        ]
+    subprocess.run(
+        command,
+        check=True,
+        timeout=180,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
-        subprocess.run(
-            command,
-            check=True,
-            timeout=90,
-            capture_output=True,
-        )
-
-        for path in sorted(Path(directory).glob("frame-*.jpg")):
-            encoded = base64.b64encode(
-                path.read_bytes()
-            ).decode("ascii")
-
-            frames.append(
-                "data:image/jpeg;base64," + encoded
-            )
-
+    frames = sorted(Path(folder).glob("frame_*.jpg"))
     if not frames:
-        raise RuntimeError(
-            "نتوانستم از ویدئو تصویر استخراج کنم."
-        )
+        raise RuntimeError("No video frames could be extracted")
 
     return frames
 
 
-def generate_caption(video_path):
-    if not AI_API_KEY:
-        raise RuntimeError("AIMLAPI_KEY تنظیم نشده است.")
-
-    frames = extract_frames(video_path)
+def make_caption(video_path, folder):
+    frames = extract_frames(video_path, folder)
 
     content = [{
         "type": "text",
         "text": (
-            "این تصاویر، چند فریم از یک ویدئو هستند. "
-            "موضوع و اتفاقات قابل مشاهده را تحلیل کن. "
-            "سپس یک کپشن فارسی جذاب برای انتشار در کانال "
-            "بله بنویس. اطلاعاتی که در تصاویر مشخص نیست "
-            "اختراع نکن. خروجی شامل عنوان کوتاه، توضیح "
-            "مرتبط و حداکثر پنج هشتگ باشد. فقط کپشن را بده."
+            "تصاویر این ویدئو را بررسی کن و یک کپشن فارسی جذاب و دقیق "
+            "برای انتشار در کانال بله بنویس. محتوای دیده‌شده را توصیف کن؛ "
+            "اطلاعاتی را که از تصاویر معلوم نیست، جعل نکن. "
+            "کپشن کوتاه باشد و در صورت مناسب بودن چند هشتگ مرتبط داشته باشد. "
+            "فقط متن کپشن را برگردان."
         ),
     }]
 
     for frame in frames:
+        with open(frame, "rb") as image_file:
+            encoded = base64.b64encode(image_file.read()).decode("ascii")
+
         content.append({
             "type": "image_url",
-            "image_url": {"url": frame},
+            "image_url": {
+                "url": "data:image/jpeg;base64," + encoded
+            },
         })
 
     response = session.post(
         AI_BASE_URL + "/chat/completions",
         headers={
-            "Authorization": "Bearer " + AI_API_KEY,
+            "Authorization": "Bearer " + AI_KEY,
             "Content-Type": "application/json",
         },
         json={
             "model": AI_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": content,
-            }],
-            "temperature": 0.7,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 350,
+            "temperature": 0.5,
         },
-        timeout=120,
+        timeout=180,
     )
-
     response.raise_for_status()
-    data = response.json()
 
-    caption = (
-        data["choices"][0]["message"]["content"]
-    )
+    result = response.json()
+    caption = result["choices"][0]["message"]["content"]
 
-    if not isinstance(caption, str) or not caption.strip():
-        raise RuntimeError("هوش مصنوعی کپشن تولید نکرد.")
+    if isinstance(caption, list):
+        caption = " ".join(
+            item.get("text", "")
+            for item in caption
+            if isinstance(item, dict)
+        )
 
-    return caption.strip()[:3500]
+    caption = str(caption).strip()
+    if not caption:
+        raise RuntimeError("AI returned an empty caption")
 
-
-# =========================================================
-# PROCESS NEW CHANNEL VIDEO
-# =========================================================
-
-def find_video(message):
-    for key in ("video", "animation"):
-        item = message.get(key)
-        if isinstance(item, dict) and item.get("file_id"):
-            return item["file_id"]
-
-    document = message.get("document") or {}
-    if (
-        document.get("file_id")
-        and str(document.get("mime_type", "")).startswith("video/")
-    ):
-        return document["file_id"]
-
-    return None
+    return caption[:900]
 
 
-def process_channel_video(message):
-    chat = message.get("chat", {})
-    username = chat.get("username", "")
-    source_id = str(chat.get("id", ""))
+def send_video(chat_id, video_path, caption, reply_markup=None):
+    data = {
+        "chat_id": str(chat_id),
+        "caption": caption[:1000],
+    }
 
-    expected = SOURCE_CHANNEL.lstrip("@")
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(
+            reply_markup, ensure_ascii=False
+        )
 
-    if username:
-        if username.lower() != expected.lower():
-            return
-    elif SOURCE_CHANNEL.lstrip("@") != source_id:
+    with open(video_path, "rb") as video_file:
+        return bale(
+            "sendVideo",
+            data=data,
+            files={
+                "video": (
+                    Path(video_path).name,
+                    video_file,
+                    "video/mp4",
+                )
+            },
+            timeout=240,
+        )
+
+
+def process_source_video(message):
+    if not ADMIN_CHAT_ID:
+        print("ADMIN_CHAT_ID is not configured; video skipped.")
         return
 
-    file_id = find_video(message)
+    video = message.get("video")
+    if not video:
+        return
+
+    file_id = video.get("file_id")
     if not file_id:
         return
 
-    message_id = message.get("message_id")
-    key = f"{source_id}:{message_id}"
+    with tempfile.TemporaryDirectory(prefix="bale_ai_") as folder:
+        video_path = str(Path(folder) / "source_video.mp4")
 
-    with sqlite3.connect(DB_PATH) as con:
-        exists = con.execute(
-            "SELECT 1 FROM processed WHERE message_key=?",
-            (key,),
-        ).fetchone()
+        download_video(file_id, video_path)
+        caption = make_caption(video_path, folder)
 
-        if exists:
-            return
+        # ویدئو و کپشن ابتدا برای تأیید مدیر ارسال می‌شوند.
+        review_markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ تأیید و انتشار",
+                        "callback_data": "approve",
+                    },
+                    {
+                        "text": "❌ رد ویدئو",
+                        "callback_data": "reject",
+                    },
+                ]
+            ]
+        }
 
-        con.execute(
-            "INSERT INTO processed(message_key) VALUES(?)",
-            (key,),
-        )
-
-    video_path = None
-
-    try:
-        video_path = download_bale_video(file_id)
-        caption = generate_caption(video_path)
-
-        with sqlite3.connect(DB_PATH) as con:
-            cursor = con.execute(
-                """
-                INSERT INTO pending(
-                    video_path, caption,
-                    source_message_id, status, created_at
-                ) VALUES (?, ?, ?, 'pending', ?)
-                """,
-                (
-                    video_path,
-                    caption,
-                    message_id,
-                    int(time.time()),
-                ),
-            )
-            pending_id = cursor.lastrowid
-
-        send_message(
+        review = send_video(
             ADMIN_CHAT_ID,
-            "🎬 ویدئوی جدید تحلیل شد.\n\n"
-            + "📝 کپشن پیشنهادی:\n\n"
-            + caption
-            + "\n\nبرای انتشار، تأیید کن.",
-            keyboard=[[
-                {
-                    "text": "✅ تأیید و انتشار",
-                    "callback_data": f"approve:{pending_id}",
-                },
-                {
-                    "text": "❌ رد",
-                    "callback_data": f"reject:{pending_id}",
-                },
-            ]],
-        )
-
-    except Exception as exc:
-        if video_path:
-            Path(video_path).unlink(missing_ok=True)
-
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute(
-                "DELETE FROM processed WHERE message_key=?",
-                (key,),
-            )
-
-        send_message(
-            ADMIN_CHAT_ID,
-            "⚠️ پردازش ویدئو ناموفق بود:\n"
-            + str(exc)[:700],
-        )
-
-
-# =========================================================
-# APPROVAL / REJECTION
-# =========================================================
-
-def handle_callback(callback):
-    sender = callback.get("from", {})
-    if str(sender.get("id")) != str(ADMIN_CHAT_ID):
-        answer_callback(
-            callback.get("id"), "اجازه دسترسی نداری."
-        )
-        return
-
-    data = callback.get("data", "")
-    if ":" not in data:
-        return
-
-    action, raw_id = data.split(":", 1)
-    if action not in ("approve", "reject"):
-        return
-
-    try:
-        pending_id = int(raw_id)
-    except ValueError:
-        return
-
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            """
-            SELECT video_path, caption, status
-            FROM pending WHERE id=?
-            """,
-            (pending_id,),
-        ).fetchone()
-
-    if not row:
-        answer_callback(callback.get("id"), "پست پیدا نشد.")
-        return
-
-    video_path, caption, status = row
-
-    if status != "pending":
-        answer_callback(callback.get("id"), "این مورد قبلاً بررسی شده.")
-        return
-
-    if action == "reject":
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute(
-                "UPDATE pending SET status='rejected' WHERE id=?",
-                (pending_id,),
-            )
-
-        Path(video_path).unlink(missing_ok=True)
-        answer_callback(callback.get("id"), "پست رد شد.")
-        return
-
-    if not DESTINATION_CHANNEL:
-        answer_callback(
-            callback.get("id"),
-            "DESTINATION_CHANNEL تنظیم نشده است.",
-        )
-        return
-
-    try:
-        send_video(
-            DESTINATION_CHANNEL,
             video_path,
             caption,
+            review_markup,
         )
 
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute(
-                "UPDATE pending SET status='published' WHERE id=?",
-                (pending_id,),
+        review_message_id = review.get("message_id")
+        if not review_message_id:
+            raise RuntimeError("Review message ID was not returned")
+
+        # فایل موقت پس از پایان این تابع حذف می‌شود؛
+        # برای انتشار بعد از تأیید، باید دوباره دریافتش کنیم.
+        pending[str(review_message_id)] = {
+            "file_id": file_id,
+            "caption": caption,
+        }
+
+
+def handle_callback(update):
+    query = update.get("callback_query") or {}
+    data = query.get("data")
+    query_id = query.get("id")
+    message = query.get("message") or {}
+    chat = message.get("chat") or {}
+    message_id = message.get("message_id")
+
+    if not query_id:
+        return
+
+    if not ADMIN_CHAT_ID or str(chat.get("id")) != ADMIN_CHAT_ID:
+        bale("answerCallbackQuery", {
+            "callback_query_id": query_id,
+            "text": "اجازه انجام این کار را نداری.",
+        })
+        return
+
+    item = pending.get(str(message_id))
+    if not item:
+        bale("answerCallbackQuery", {
+            "callback_query_id": query_id,
+            "text": "این درخواست در حافظه ربات موجود نیست.",
+        })
+        return
+
+    if data == "reject":
+        pending.pop(str(message_id), None)
+        bale("answerCallbackQuery", {
+            "callback_query_id": query_id,
+            "text": "ویدئو رد شد.",
+        })
+        return
+
+    if data != "approve":
+        return
+
+    if not DEST_CHANNEL:
+        raise RuntimeError("DEST_CHANNEL is not configured")
+
+    with tempfile.TemporaryDirectory(prefix="bale_publish_") as folder:
+        video_path = str(Path(folder) / "approved_video.mp4")
+        download_video(item["file_id"], video_path)
+        send_video(DEST_CHANNEL, video_path, item["caption"])
+
+    pending.pop(str(message_id), None)
+
+    bale("answerCallbackQuery", {
+        "callback_query_id": query_id,
+        "text": "ویدئو منتشر شد.",
+    })
+
+
+def handle_update(update):
+    callback = update.get("callback_query")
+    if callback:
+        handle_callback(update)
+        return
+
+    message = update.get("message") or {}
+    chat = message.get("chat") or {}
+    text = str(message.get("text", "")).strip()
+
+    # فرمان‌های خصوصی برای راه‌اندازی اولیه و دریافت شناسه
+    if chat.get("type") == "private" and text in ("/start", "/id"):
+        send_text(
+            chat["id"],
+            "ربات فعال است.\n"
+            f"شناسه گفت‌وگوی شما: {chat['id']}\n"
+            "برای تأیید و انتشار ویدئو، ADMIN_CHAT_ID را در Render "
+            "با همین شناسه تنظیم کن.",
+        )
+        return
+
+    # فقط پست‌های کانال مبدأ پردازش می‌شوند.
+    channel_post = update.get("channel_post") or {}
+    if channel_post and source_matches(channel_post):
+        if channel_post.get("video"):
+            process_source_video(channel_post)
+
+
+def main():
+    global offset
+
+    if not BALE_TOKEN:
+        raise RuntimeError("BALE_BOT_TOKEN is missing")
+    if not AI_KEY:
+        raise RuntimeError("AIMLAPI_KEY is missing")
+
+    print("Bale AI video worker is starting...")
+
+    while True:
+        try:
+            updates = bale(
+                "getUpdates",
+                data={
+                    "offset": str(offset),
+                    "timeout": "25",
+                    "allowed_updates": json.dumps([
+                        "message", "channel_post", "callback_query"
+                    ]),
+                },
+                timeout=40,
             )
 
-        Path(video_path).unlink(missing_ok=True)
-        answer_callback(callback.get("id"), "منتشر شد.")
+            for update in updates or []:
+                offset = max(offset, int(update["update_id"]) + 1)
 
-    except Exception as exc:
-        answer_callback(
-            callback.get("id"),
-            "انتشار ناموفق بود؛ گزارش خطا را بررسی کن.",
-        )
-        send_message(
-            ADMIN_CHAT_ID,
-            "خطای انتشار:\n" + str(exc)[:700],
-        )
+                try:
+                    handle_update(update)
+                except Exception as exc:
+                    print(
+                        f"Update {update.get('update_id')} failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
 
-
-# =========================================================
-# WEBHOOK
-# =========================================================
-
-@app.get("/")
-def health():
-    return {
-        "status": "running",
-        "service": "Bale AI Video Rewriter",
-    }
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    update = await request.json()
-
-    try:
-        callback = update.get("callback_query")
-        if callback:
-            handle_callback(callback)
-            return {"ok": True}
-
-        message = (
-            update.get("channel_post")
-            or update.get("message")
-        )
-
-        if not message:
-            return {"ok": True}
-
-        chat = message.get("chat", {})
-        text = message.get("text", "")
-
-        # Respond to commands sent privately by the admin.
-        if (
-            str(chat.get("id")) == str(ADMIN_CHAT_ID)
-            and text.startswith("/start")
-        ):
-            send_message(
-                ADMIN_CHAT_ID,
-                "سلام! ربات تحلیل ویدئو فعال است.\n"
-                "برای پایش خودکار، ربات باید دسترسی "
-                "لازم به کانال منبع داشته باشد.",
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            print(
+                f"Polling error: {type(exc).__name__}: {exc}",
+                flush=True,
             )
-            return {"ok": True}
+            time.sleep(5)
 
-        if "channel_post" in update:
-            process_channel_video(message)
 
-        return {"ok": True}
-
-    except Exception as exc:
-        # Avoid repeated webhook retries for the same bad update.
-        print("Webhook error:", repr(exc))
-        return {"ok": True}
+if __name__ == "__main__":
+    main()
